@@ -1,4 +1,5 @@
 import os
+import json
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,20 @@ from database import db, create_document, get_documents
 
 # Schemas for reference
 from schemas import Topic as TopicSchema, Conversation as ConversationSchema, Suggestion as SuggestionSchema
+
+# Optional OpenAI client (LLM classification)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+USE_LLM_DEFAULT = os.getenv("USE_LLM", "true").lower() in {"1", "true", "yes", "on"}
+
+try:
+    if OPENAI_API_KEY:
+        from openai import OpenAI  # type: ignore
+        _openai_client = OpenAI()
+    else:
+        _openai_client = None
+except Exception:
+    _openai_client = None
 
 app = FastAPI(title="Adaptive Topic Explorer API")
 
@@ -82,6 +97,89 @@ def simple_classify(transcript: str) -> Dict[str, Optional[str]]:
     return best
 
 
+def llm_classify(transcript: str) -> Dict[str, Any]:
+    """Use an LLM to classify transcript to an existing topic/subtopic.
+    Falls back to heuristic if LLM unavailable or errors.
+    Returns: {topic: Optional[str], subtopic: Optional[str], confidence: float, score: float, suggested_name: Optional[str], reason: Optional[str], used_llm: bool}
+    """
+    # If client not available, fallback
+    if _openai_client is None:
+        h = simple_classify(transcript)
+        return {"topic": h.get("topic"), "subtopic": h.get("subtopic"), "confidence": 0.0, "score": float(h.get("score", 0)), "suggested_name": None, "reason": "LLM unavailable; used heuristic.", "used_llm": False}
+
+    # Build knowledge of topics tree
+    topics = list(db["topic"].find({}).sort("name", 1))
+    topic_tree: Dict[str, List[str]] = {}
+    for t in topics:
+        name = t.get("name")
+        parent = t.get("parent")
+        if parent:
+            topic_tree.setdefault(parent, []).append(name)
+        else:
+            topic_tree.setdefault(name, [])
+    # Limit to avoid overly long prompts
+    MAX_PARENTS = 50
+    MAX_CHILDREN = 25
+    trimmed = {}
+    for i, (k, v) in enumerate(topic_tree.items()):
+        if i >= MAX_PARENTS:
+            break
+        trimmed[k] = v[:MAX_CHILDREN]
+
+    system_prompt = (
+        "You are a precise classifier for customer support conversations. "
+        "Choose the best matching topic and optional subtopic from the provided catalog. "
+        "If no adequate match exists, return nulls and propose a concise suggested_name (max 3 words). "
+        "Respond ONLY with JSON that matches the schema."
+    )
+
+    schema_example = {
+        "topic": "<string or null>",
+        "subtopic": "<string or null>",
+        "confidence": 0.0,
+        "suggested_name": "<string or null>",
+        "reason": "<brief rationale>"
+    }
+
+    user_content = {
+        "catalog": trimmed,
+        "transcript": transcript,
+        "instructions": "Return highest-likelihood topic/subtopic if a clear match (confidence 0-1). If not clear, return both as null and propose suggested_name."
+    }
+
+    try:
+        completion = _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_content)}
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = completion.choices[0].message.content or "{}"
+        data = json.loads(content)
+        topic = data.get("topic")
+        subtopic = data.get("subtopic")
+        confidence = float(data.get("confidence", 0.0))
+        suggested_name = data.get("suggested_name")
+        reason = data.get("reason")
+        # Provide a simple numeric score aligned with heuristic semantics (0-5)
+        score = max(0.0, min(5.0, confidence * 5.0))
+        return {
+            "topic": topic,
+            "subtopic": subtopic,
+            "confidence": confidence,
+            "score": score,
+            "suggested_name": suggested_name,
+            "reason": reason,
+            "used_llm": True,
+        }
+    except Exception as e:
+        h = simple_classify(transcript)
+        return {"topic": h.get("topic"), "subtopic": h.get("subtopic"), "confidence": 0.0, "score": float(h.get("score", 0)), "suggested_name": None, "reason": f"LLM error: {str(e)[:100]}; used heuristic.", "used_llm": False}
+
+
 # -----------------------
 # Pydantic request/response models
 # -----------------------
@@ -96,6 +194,7 @@ class MergeRequest(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     transcript: str
+    use_llm: Optional[bool] = Field(None, description="Override to force LLM on/off. Defaults from env USE_LLM and availability.")
 
 class SuggestionDecision(BaseModel):
     parent: Optional[str] = None
@@ -120,7 +219,9 @@ def test_database():
         "database_url": None,
         "database_name": None,
         "connection_status": "Not Connected",
-        "collections": []
+        "collections": [],
+        "llm_available": bool(_openai_client is not None),
+        "llm_model": OPENAI_MODEL if _openai_client is not None else None,
     }
     try:
         if db is not None:
@@ -188,7 +289,7 @@ def merge_topics(payload: MergeRequest):
 
 
 # -----------------------
-# Analyze conversations
+# Analyze conversations (LLM-first, heuristic fallback)
 # -----------------------
 @app.post("/api/conversations/analyze")
 def analyze_conversation(req: AnalyzeRequest):
@@ -196,12 +297,21 @@ def analyze_conversation(req: AnalyzeRequest):
     if not transcript:
         raise HTTPException(status_code=400, detail="Transcript is empty")
 
-    result = simple_classify(transcript)
+    use_llm = req.use_llm if req.use_llm is not None else USE_LLM_DEFAULT
+
+    if use_llm and _openai_client is not None:
+        result = llm_classify(transcript)
+        used_llm = result.get("used_llm", False)
+    else:
+        h = simple_classify(transcript)
+        result = {"topic": h.get("topic"), "subtopic": h.get("subtopic"), "confidence": 0.0, "score": float(h.get("score", 0)), "suggested_name": None, "reason": "LLM disabled or unavailable; used heuristic.", "used_llm": False}
+        used_llm = False
 
     assigned = False
-    suggestion_id: Optional[str] = None
 
-    if result.get("score", 0) >= 3:  # heuristic threshold
+    # Decide assignment
+    # If we have a topic selected and either confidence >= 0.6 (LLM) or score >= 3 (heuristic-style)
+    if result.get("topic") and ((used_llm and float(result.get("confidence", 0)) >= 0.6) or (not used_llm and float(result.get("score", 0)) >= 3.0)):
         assigned = True
         data = ConversationSchema(
             transcript=transcript,
@@ -210,18 +320,24 @@ def analyze_conversation(req: AnalyzeRequest):
         )
         conv_id = create_document("conversation", data)
         return {
-            "assigned": assigned,
+            "assigned": True,
             "topic": result.get("topic"),
             "subtopic": result.get("subtopic"),
             "conversation_id": conv_id,
-            "score": result.get("score"),
+            "score": float(result.get("score", 0)),
+            "confidence": float(result.get("confidence", 0)),
+            "used_llm": used_llm,
         }
 
     # No confident match: create suggestion
-    kws = extract_keywords(transcript, top_n=3)
-    name = " ".join(kws[:2]).title() if kws else "General Inquiry"
-    reason = f"No strong match found. Suggested from keywords: {', '.join(kws)}."
-    suggestion = SuggestionSchema(name=name, reason=reason, status="pending")
+    suggested_name = result.get("suggested_name")
+    reason = result.get("reason") or "No strong match found."
+    if not suggested_name:
+        kws = extract_keywords(transcript, top_n=3)
+        suggested_name = " ".join(kws[:2]).title() if kws else "General Inquiry"
+        reason = f"No strong match found. Suggested from keywords: {', '.join(kws)}."
+
+    suggestion = SuggestionSchema(name=suggested_name, reason=reason, status="pending")
     suggestion_id = create_document("suggestion", suggestion)
 
     # Store conversation with pointer to suggestion
@@ -237,9 +353,11 @@ def analyze_conversation(req: AnalyzeRequest):
         "assigned": False,
         "conversation_id": conv_id,
         "suggestion_id": suggestion_id,
-        "suggested_name": name,
+        "suggested_name": suggested_name,
         "reason": reason,
         "score": float(result.get("score", 0)),
+        "confidence": float(result.get("confidence", 0)),
+        "used_llm": used_llm,
     }
 
 
